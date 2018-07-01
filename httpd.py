@@ -3,8 +3,8 @@
 import sys
 import getopt
 import os
-import asyncore_epoll as asyncore
-import datetime
+import asyncore
+import asynchat
 import platform
 import re
 import socket
@@ -28,7 +28,7 @@ class HTTPRequest(object):
 
 class GETRequest(HTTPRequest):
 
-    def __init__(self, headers, uri="", http_version=1.1, body=None):
+    def __init__(self, headers, uri="", http_version=1.0, body=None):
         super(GETRequest, self).__init__(headers, uri=uri, http_version=http_version, body=body)
         self.method = "GET"
 
@@ -45,14 +45,14 @@ class GETRequest(HTTPRequest):
 
 class HEADRequest(HTTPRequest):
 
-    def __init__(self, headers, uri="", http_version=1.1, body=None):
+    def __init__(self, headers, uri="", http_version=1.0, body=None):
         super(HEADRequest, self).__init__(headers, uri=uri, http_version=http_version, body=body)
         self.method = "HEAD"
 
 
 class POSTRequest(HTTPRequest):
 
-    def __init__(self, headers, uri="", http_version=1.1, body=None):
+    def __init__(self, headers, uri="", http_version=1.0, body=None):
         super(POSTRequest, self).__init__(headers, uri=uri, http_version=http_version, body=body)
         self.method = "POST"
 
@@ -60,101 +60,102 @@ class POSTRequest(HTTPRequest):
         return self.body
 
 
+class ContentProducer(object):
+
+    def __init__(self, file_descriptor, chunk_size=4096):
+        self.fd = file_descriptor
+        self.chunk_size = chunk_size
+
+    def more(self):
+        if self.fd:
+            data = self.fd.read(self.chunk_size)
+            if data:
+                return data
+            self.fd.close()
+            self.fd = None
+        return ""
+
+
+class HTTPHandler(asynchat.async_chat):
+
+    def __init__(self, server, sock, addr):
+        asynchat.async_chat.__init__(self, sock=sock)
+        self.server = server
+        self.addr = addr
+        self.set_terminator("\r\n\r\n")
+        self.max_buffer_size = 256
+        self.ibuffer = b""
+
+    def collect_incoming_data(self, data):
+        if len(self.ibuffer) > self.max_buffer_size:
+            self.ibuffer = b""
+        self.ibuffer += data
+
+    def found_terminator(self):
+        http_request = self.server.parse_request(self.ibuffer)
+        self.server.handle_request(self, http_request)
+
+    def send_response(self, st_line, **response_headers):
+        self.push(st_line + "\r\n")
+        for hdr, hdr_v in response_headers.items():
+            self.push(str(hdr) + ": " + str(hdr_v) + "\r\n")
+        self.push("\r\n")
+
+
 class HTTPServer(asyncore.dispatcher):
 
-    index = "index"
+    index = "index.html"
 
-    __CHUNK_SIZE = 8 * 10240
-    __encoded_chars = {"%21": '!', "%23": '#', "%24": '$', "%26": '&', "%27": '\'',
-                       "%28": '(', "%29": ')', "%2A": '*', "%2B": '+', "%2C": ',',
-                       "%2F": '/', "%3A": ':', "%3B": ';', "%3D": '=', "%3F": '?',
-                       "%40": '@', "%5B": '[', "%5D": ']', "+": ' '}
-    __content_types = ("html", "css", "js", "jpg", "jpeg", "png", "gif", "swf")
+    __encoded_chars = {"%20": ' ', "%21": '!', "%22": "\"", "%23": '#', "%24": '$', "%25": '%', "%26": '&',
+                       "%27": '\'', "%28": '(', "%29": ')', "%30": "0", "%31": "1", "%32": "2", "%33": "3",
+                       "%34": '4', "%35": '5', "%36": '6', "%37": '7', "%38": '8', "%39": '9', "%40": '@',
+                       "%41": 'A', "%42": 'B', "%43": 'C', "%44": 'D', "%45": 'E', "%46": 'F', "%47": 'G',
+                       "%48": 'H', "%49": 'I',  "%4A": 'J', "%4B": 'K', "%4C": 'L', "%4D": 'M', "%4E": 'N',
+                       "%4F": 'O', "%50": 'P', "%51": 'Q', "%52": 'R', "%53": 'S', "%54": 'T', "%55": 'U',
+                       "%56": 'V', "%57": 'W', "%58": 'X', "%59": 'Y', "%5A": 'Z', "%5B": '[', "%5C": '\\',
+                       "%5D": ']', "%5E": '^', "%5F": '_', "%60": ']', "%61": 'a', "%62": 'b', "%63": 'c',
+                       "%64": 'd', "%65": 'e', "%66": 'f', "%67": 'g', "%68": 'h', "%69": 'i', "%6A": 'j',
+                       "%6B": 'k', "%6C": 'l', "%6D": 'm', "%6E": 'n', "%6F": 'o', "%70": 'p', "%71": 'q',
+                       "%72": 'r', "%73": 's', "%74": 't', "%75": 'u', "%76": 'v', "%77": 'w', "%78": 'x',
+                       "%79": 'y', "7A": 'z', "7B": '{', "7C": '|', "7D": '}', "7E": '~', "7F": ' ',
+                       "%2B": '+', "%2C": ',', "%2D": '-', "%2E": '.',  "%2F": '/', "%3A": ':', "%3B": ';',
+                       "%3C": '<', "%3D": '=', "%3E": '>', "%3F": '?',  "+": ' '}
+    __content_types = {"html": "text/html", "css": "text/css", "js": "application/javascript",
+                       "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                       "gif": "image/gif", "swf": "application/x-shockwave-flash"}
 
-    def __init__(self, address="", port=8080, document_root="/home/artem"):
+    def __init__(self, address="", port=8080, document_root="/home/artem", forbidden=""):
         asyncore.dispatcher.__init__(self)
         self.address = address
         self.port = port
         self.document_root = document_root
+        self.forbidden_methods = forbidden.split(',')
         if self.document_root[-1:] == '/':
             self.document_root = self.document_root[:-1]
 
         self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
         self.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         self.bind((self.address, self.port))
-        self.listen(1)
+        self.listen(5)
         log.debug("Listening on address %s:%s", address, port)
 
     def serve_forever(self):
         try:
-            asyncore.loop(timeout=600, use_poll=True, poller=asyncore.epoll_poller)
+            asyncore.loop(timeout=60, use_poll=True)
         except KeyboardInterrupt:
             log.debug("Close worker")
+            asyncore.close_all()
         finally:
+
             self.close()
 
     def handle_accept(self):
         conn, addr = self.accept()
         if conn is not None and addr is not None:
-            request = conn.recv(self.__CHUNK_SIZE)
-            http_request = self.parse_request(request)
-            self.handle_request(http_request, conn)
-
-    def handle_request(self, http_request, connection):
-        send_content = False
-        os_path = None
-        if not http_request:
-            status_line = "HTTP/1.0 405 Method Not Allowed"
-            response_headers = {
-                "Host": socket.gethostname(), "Date": self.get_date(),
-                "Server": self.get_server(), "Connection": "close",
-            }
-        else:
-            os_path, parameters = self.uri_resolve(http_request)
-            if os.path.isfile(os_path):
-                status_line = "HTTP/1.0 200 OK"
-                response_headers = {
-                    "Host": socket.gethostname(), "Content-Type": self.detect_content_type(os_path),
-                    "Date": self.get_date(), "Server": self.get_server(),
-                    "Connection": "close", "Content-Length": os.path.getsize(os_path)
-                }
-                if http_request.method is not "HEAD":
-                    send_content = True
-            else:
-                log.debug(os_path)
-                status_line = "HTTP/1.0 404 Not Found"
-                response_headers = {
-                    "Host": socket.gethostname(), "Date": self.get_date(),
-                    "Server": self.get_server(), "Connection": "close",
-                }
-
-        self.send_response(connection, status_line, **response_headers)
-        if send_content:
-            self.send_file(connection, os_path)
-
-    def send_response(self, client_socket, st_line, **response_headers):
-        log.debug(st_line)
-        log.debug(client_socket)
-        client_socket.send(st_line + "\r\n")
-        for hdr, hdr_v in response_headers.items():
-            client_socket.send(str(hdr) + ": " + str(hdr_v) + "\r\n")
-        client_socket.send("\r\n")
-
-    def send_file(self, client_socket, path):
-        with open(path, 'rb') as f:
-            data = f.read(self.__CHUNK_SIZE)
-            while data:
-                client_socket.send(data)
-                data = f.read(self.__CHUNK_SIZE)
-            f.close()
-
-    def detect_content_type(self, filename):
-        if filename.endswith(self.__content_types):
-            return filename.split('.')[-1]
-        else:
-            return "unknown"
+            HTTPHandler(self, sock=conn, addr=addr)
 
     def parse_request(self, request):
+        """returns object of HTTPRequest as certain data structure"""
         if not request:
             return None
 
@@ -170,16 +171,55 @@ class HTTPServer(asyncore.dispatcher):
 
         request_lines = request.split("\r\n")
         request_line = request_lines[0]
-        delimiter_index = request_lines.index("")
-        headers = request_lines[1:delimiter_index]
-        message = "".join(request_lines[delimiter_index::])
         method, uri, http_version = parse_request_line(request_line)
+        headers = request_lines[1:]
+        body = ""
         if method in http_requests:
-            return http_requests[method](headers, uri, http_version, message)
+            return http_requests[method](headers, uri, http_version, body)
         else:
             return None
 
+    def handle_request(self, channel, http_request):
+        """sends response via given channel (HTTPHandler)"""
+        send_content = False
+        content = None
+        status_line = "HTTP/1.0 405 Method Not Allowed"
+        response_headers = {
+                "Host": socket.gethostname(), "Date": HTTPServer.get_date(),
+                "Server": HTTPServer.get_server(), "Connection": "close",
+            }
+        try:
+            if not http_request:
+                return
+            os_path, parameters = self.uri_resolve(http_request)
+
+            if os_path is "Forbidden location":
+                status_line = "HTTP/1.0 403 Forbidden"
+                return
+
+            if http_request.method in self.forbidden_methods:
+                status_line = "HTTP/1.0 405 Method Not Allowed"
+                return
+
+            log.debug(os_path)
+            content = open(os_path, "rb")
+        except IOError:
+            status_line = "HTTP/1.0 404 Not Found"
+        else:
+            status_line = "HTTP/1.0 200 OK"
+            response_headers["Content-Type"] = HTTPServer.detect_content_type(os_path)
+            response_headers["Content-Length"] = os.path.getsize(os_path)
+
+            if http_request.method is not "HEAD":
+                send_content = True
+        finally:
+            channel.send_response(status_line, **response_headers)
+            if send_content:
+                channel.push_with_producer(ContentProducer(content))
+            channel.close_when_done()
+
     def uri_resolve(self, http_request):
+        """returns location of requested resource on server and given parameters of request"""
         uri_parts = http_request.uri.split('?') + [None]
 
         if '' in uri_parts:
@@ -187,14 +227,27 @@ class HTTPServer(asyncore.dispatcher):
 
         parameters = http_request.get_params(uri_parts[1])
 
-        resource_location = self.decode_uri(self.normalize_uri(uri_parts[0]))
+        resource_location = self.decode_uri(HTTPServer.normalize_uri(uri_parts[0]))
+
+        if resource_location.find("../") != -1:
+            return "Forbidden location", parameters
+
         if resource_location[-1:] == '/':
-            resource_location += (self.index + '.html')
+            resource_location += HTTPServer.index
 
         return self.document_root + resource_location, parameters
 
     @staticmethod
+    def detect_content_type(filename):
+        """returns content type of content (if known) for 'Content-Type' headers"""
+        if filename.endswith(tuple(HTTPServer.__content_types.keys())):
+            return HTTPServer.__content_types[filename.split('.')[-1]]
+        else:
+            return "unknown"
+
+    @staticmethod
     def normalize_uri(uri):
+        """returns uri without repeated characters"""
         repeated_chars = ['/', '?', '#']
 
         def replace_repeated(dupl, string):
@@ -207,52 +260,85 @@ class HTTPServer(asyncore.dispatcher):
 
         return uri
 
-    def decode_uri(self, encoded_uri):
-        for enc, dec in self.__encoded_chars.iteritems():
-            encoded_uri = encoded_uri.replace(enc, dec)
+    @staticmethod
+    def decode_uri(encoded_uri):
+        """returns uri with decoded characters - dictionary for translation is __encoded_chars"""
+        for enc, dec in HTTPServer.__encoded_chars.iteritems():
+            encoded_uri = encoded_uri.replace(enc, dec).replace(enc.lower(), dec)
         return encoded_uri
 
     @staticmethod
     def get_date():
+        """returns value for 'Date' header"""
         return strftime("%a, %d %b %Y %H:%M:%S GMT", gmtime())
 
     @staticmethod
     def get_server():
+        """returns value for 'Server' header"""
         return platform.system() + " " + platform.release()
 
 
-def run():
-    server = HTTPServer(address="localhost", port=8080)
+def run(work):
+    server = HTTPServer(address=server_addr, port=port, document_root=root, forbidden=forbidden_methods)
     server.serve_forever()
 
+def help()
+    pass
 
 if __name__ == "__main__":
     try:
-        opts, args = getopt.getopt(sys.argv[1:], 'c:p:h:l', ['config=', 'port=', 'host=', 'log='])
+        opts, args = getopt.getopt(sys.argv[1:], 'h:r:p:a:l:w:f', ['help=', 'root=', 'port=',
+                                                                   'host=', 'log=', 'workers='
+                                                                   'forbidden_methods='])
     except getopt.GetoptError:
-        pass
+        help()
         sys.exit(2)
+
+    port = 8080
+    server_addr = "0.0.0.0"
+    workers = 10
+    forbidden_methods = "POST"
+    root = "/home/artem"
+    log_path = None
 
     for opt, arg in opts:
         if opt in ('-h', '--help'):
             pass
             sys.exit(2)
-        elif opt in ('-c', '--config'):
+        elif opt in ('-r', '--root'):
+            root = arg.strip('=')
             pass
         elif opt in ('-p', '--port'):
+            port = int(arg.strip('='))
             pass
         elif opt in ('-h', '--host'):
+            server_addr = arg.strip('=')
             pass
         elif opt in ('-l', '--log'):
+            log_path = arg.strip('=')
+            pass
+        elif opt in ('-w', '--workers'):
+            workers = int(arg.strip('='))
+            pass
+        elif opt in ('-f', '--forbidden_methods'):
+            forbidden_methods = arg.strip('=')
             pass
         else:
             pass
 
     logging.basicConfig(
         level=getattr(logging, "DEBUG"),
-        format="%(name)s: %(process)d %(message)s")
+        format="%(process)d: %(message)s", filemode='w', filename=log_path)
     log = logging.getLogger(__name__)
 
-    for _ in xrange(1):
-        p = multiprocessing.Process(target=run)
-        p.start()
+    pool = multiprocessing.Pool(workers)
+    p = pool.map_async(run, range(workers))
+
+    try:
+        results = p.get(0xFFFF)
+    except KeyboardInterrupt:
+        log.debug("parent received control-c")
+
+
+
+
