@@ -124,7 +124,7 @@ class HTTPServer(asyncore.dispatcher):
                        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
                        "gif": "image/gif", "swf": "application/x-shockwave-flash"}
 
-    def __init__(self, address="", port=8080, document_root="/home/artem", forbidden=""):
+    def __init__(self, address="", port=8080, document_root="/var/www/html", forbidden=""):
         asyncore.dispatcher.__init__(self)
         self.address = address
         self.port = port
@@ -201,7 +201,6 @@ class HTTPServer(asyncore.dispatcher):
                 status_line = "HTTP/1.0 405 Method Not Allowed"
                 return
 
-            log.debug(os_path)
             content = open(os_path, "rb")
         except IOError:
             status_line = "HTTP/1.0 404 Not Found"
@@ -214,6 +213,7 @@ class HTTPServer(asyncore.dispatcher):
                 send_content = True
         finally:
             channel.send_response(status_line, **response_headers)
+            log.debug(status_line + " " + http_request.method + " " + http_request.uri)
             if send_content:
                 channel.push_with_producer(ContentProducer(content))
             channel.close_when_done()
@@ -282,14 +282,27 @@ def run(work):
     server = HTTPServer(address=server_addr, port=port, document_root=root, forbidden=forbidden_methods)
     server.serve_forever()
 
-def help()
-    pass
+
+def help():
+    print "Asynchronous http server. Uses asyncore - the server is dispatcher, \r\n" "http handler is " \
+          "separate class (async_chat) and sending content via fifo producer (ContentProducer class)\r\n " \
+          "Can work in several workers (the default is 10). In current realization supports only http/1.0 " \
+          "without cgi, ssl and only for GET, HEAD, POST methods"
+    print "Parameters description:"
+    print "-h (--help) - print help"
+    print "-r (--root) - set server root directiry for content storing. Default is /var/www/html"
+    print "-p (--port) - listening port for the server. Default is 8080"
+    print "-i (--interface) - interface for listening socket of the server. Default is 0.0.0.0 (all available)"
+    print "-l (--log) - path for logging. Default is console output"
+    print "-w (--workers) - number of process instances (workers) of the server. Default is 10"
+    print "--forbidden_methods - http methods banned for the server (http code 405 will be send). " \
+          "(like POST)"
+
 
 if __name__ == "__main__":
     try:
-        opts, args = getopt.getopt(sys.argv[1:], 'h:r:p:a:l:w:f', ['help=', 'root=', 'port=',
-                                                                   'host=', 'log=', 'workers='
-                                                                   'forbidden_methods='])
+        opts, args = getopt.getopt(sys.argv[1:], 'h:r:p:i:l:w:f', ['root=', 'port=', 'interface=', 'log=',
+                                                                   'workers=', 'forbidden_methods='])
     except getopt.GetoptError:
         help()
         sys.exit(2)
@@ -297,8 +310,8 @@ if __name__ == "__main__":
     port = 8080
     server_addr = "0.0.0.0"
     workers = 10
-    forbidden_methods = "POST"
-    root = "/home/artem"
+    forbidden_methods = ""
+    root = "/var/www/html"
     log_path = None
 
     for opt, arg in opts:
@@ -311,7 +324,7 @@ if __name__ == "__main__":
         elif opt in ('-p', '--port'):
             port = int(arg.strip('='))
             pass
-        elif opt in ('-h', '--host'):
+        elif opt in ('-i', '--interface'):
             server_addr = arg.strip('=')
             pass
         elif opt in ('-l', '--log'):
